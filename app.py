@@ -128,7 +128,7 @@ def 调用模型(prompt, img_b64, mime, key, max_retries=4):
     url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     headers = {"Authorization": f"Bearer {key}"}
     payload = {
-        "model": "glm-4v-flash",
+        "model": "glm-4.6v-flash",   # ← 改为 glm-4.6v-flash
         "messages": [{
             "role": "user",
             "content": [
