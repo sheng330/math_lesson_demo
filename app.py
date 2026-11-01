@@ -8,13 +8,23 @@ from collections import Counter
 API_KEY = st.secrets["ZHIPU_API_KEY"]
 # ====================================================================
 
+# ==================== 免费模型配置（2026-11 智谱免费档） ====================
+# 视觉识别（只读图抽文字）：glm-4.6v-flash（免费）
+# 判卷 + 讲评（数学推理）：glm-4.7-flash（免费文本模型，推理远强于视觉 flash）
+MODEL_VISION = "glm-4.6v-flash"
+MODEL_REASON = "glm-4.7-flash"
+TEMPERATURE  = 0.0   # 判卷/讲评用低温度，减少随机性
+# 提示：免费模型有速率限制（RPM/RPD），演示逐题讲评时会依次调用，
+# 429 已自动退避重试；若经常触发，可在【讲评循环】里加 time.sleep(1)。
+# ====================================================================
+
 st.set_page_config(page_title="数学试卷讲评 Demo", layout="wide")
 st.title("数学试卷 AI 讲评 Demo")
 
 # ========== 内置卷子库（明天加手写卷就在下面加一行） ==========
 内置卷子库 = {
-    "样卷 1：简单样卷（AI生成）": "builtin_papers/paper_1.jpg",
-    "样卷 2：由真实手写卷生成": "builtin_papers/handwriting_1.jpg",
+    "样卷 1：沪教版必修一模拟卷（电脑排版）": "builtin_papers/paper_1.jpg",
+    # "样卷 2：手写卷": "builtin_papers/handwriting_1.jpg",
 }
 
 # ========== 常量 ==========
@@ -125,18 +135,21 @@ for k in ["AI全部结果", "识别结果", "预判", "诊断结果", "最终归
         st.session_state[k] = None
 
 # ========== 工具函数 ==========
-def 调用模型(prompt, img_b64, mime, key, max_retries=4):
+def 调用模型(prompt, key, model, img_b64=None, mime=None, temperature=TEMPERATURE, max_retries=4):
+    """统一调用智谱 API。img_b64 传了就按多模态（图片+文本），否则纯文本。"""
     url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     headers = {"Authorization": f"Bearer {key}"}
+    if img_b64:
+        content = [
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+            {"type": "text", "text": prompt},
+        ]
+    else:
+        content = prompt  # 纯文本直接用字符串
     payload = {
-        "model": "glm-4v-flash",
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
-                {"type": "text", "text": prompt}
-            ]
-        }]
+        "model": model,
+        "temperature": temperature,
+        "messages": [{"role": "user", "content": content}],
     }
     for attempt in range(max_retries):
         try:
@@ -214,67 +227,103 @@ else:
 if 图片字节 is not None:
     st.image(图片字节, caption="当前试卷", use_column_width=True)
 
-# ========== 第1步：识别 ==========
-if st.button("① 识别试卷"):
+# ========== 第1步：识别 + 判卷（两阶段，读图与推理分离） ==========
+if st.button("① 识别并判卷"):
     if 图片字节 is None:
         st.warning("请先选择或上传试卷图片")
     else:
         img_b64 = base64.b64encode(图片字节).decode()
         mime = 图片类型
-        prompt = """
-请阅读这张高中数学试卷照片，完成以下任务：
 
-【任务一：识别所有题目】
-逐题识别试卷上的每一道题，记录：题号、题干、学生手写作答。必须把整张卷子的每一道题都识别出来，不要遗漏任何题。
+        # ---- 阶段一：视觉识别（免费视觉模型，只抽文字，不判对错） ----
+        识别prompt = """
+请仔细阅读这张高中数学试卷照片，逐题识别卷面上的题目，不要遗漏任何一道题。
 
-【任务二：AI 自主判卷】
-对每道题，你先自己解一遍，得到正确答案，然后与学生答案比较。
-注意：请特别严格地检查“含参问题”、“二次方程/不等式”、“定义域受限”、“端点能否取到”这类容易漏掉关键情况的题。
-
-【任务三：输出结果】
 对每一道题输出：
-- 题号（字符串）
-- 题干
-- 学生作答
-- AI判定：填“正确”或“错误”
-- 判定说明：一句话说明判定原因
-- 关键检查点：如果这道题判为“错误”，用一句话写出“学生解题时遗漏或出错的那个关键情况”。
-  要求用通用表述，不要只写具体数值，例如：
-  · “遗漏了参数取某个特殊值的情况”
-  · “遗漏了二次方程判别式为零或为负的情况”
-  · “遗漏了定义域端点或分母为零的限制”
-  · “遗漏了区间端点能否取到”
-  · “某一步的符号或不等号方向处理错误”
-  如果学生没有遗漏关键情况（例如只是计算错），写“仅计算错误，无遗漏关键情况”。
-  如果这道题判为“正确”，写“无”。
+- 题号（按卷面顺序的编号，字符串）
+- 题干（完整转写题目文字）
+- 学生作答（该题下学生的书写内容，尽力转写；实在看不清写“（看不清）”）
 
-请输出所有题目的 JSON 数组。不要做讲评，不要输出其他文字。
+要求：
+- 打印题和手写作答都要识别，不要漏题。
+- 只做文字转写，不要解题、不要判对错、不要讲评。
+- 数学公式用线性文本表达，例如：f(x)=sqrt(x-1)+1/(x-2)、x^2-3x+2≤0、log2(x)≥1、|x-1|≤2、x^2+bx+c、a≠0、Δ=b^2-4ac。
+
+输出 JSON 数组，每项只含 题号、题干、学生作答 三个字段。只输出 JSON，不要输出任何其他文字。
 """
-        with st.spinner("AI 正在识别并判卷..."):
-            raw = 调用模型(prompt, img_b64, mime, API_KEY)
-            结果, 原始 = 解析(raw)
-        if 结果:
-            结果 = 规范化(结果)
-            st.session_state.AI全部结果 = 结果
-            st.session_state.识别结果 = None
-            st.session_state.预判 = None
-            st.session_state.诊断结果 = None
-            st.session_state.最终归因 = None
-            st.success("AI 判卷完成，请在下方的【校对确认】环节核实错题。")
-        else:
+        with st.spinner("① 视觉识别：正在读取卷面文字..."):
+            raw = 调用模型(识别prompt, API_KEY, model=MODEL_VISION, img_b64=img_b64, mime=mime)
+            识别结果, 原始 = 解析(raw)
+        if not 识别结果 or not isinstance(识别结果, list):
             st.session_state.原始文本 = 原始
-            st.warning("模型返回非 JSON，原始内容如下：")
+            st.warning("识别阶段返回非 JSON，原始内容如下：")
             st.code(原始)
+            st.stop()
+
+        # ---- 阶段二：文本判卷（免费文本模型，独立解题后与学生作答比较） ----
+        判卷prompt = f"""
+你是高中数学阅卷老师。下面是刚从试卷照片中识别出来的题目和学生作答（识别可能有少量误差，以你能读到的内容为准）。
+
+【题目列表】
+{json.dumps(识别结果, ensure_ascii=False, indent=1)}
+
+【本册范围】{本册范围}
+【知识点体系】{知识点体系}
+【超纲约束】{超纲约束}
+
+请对每一道题：
+1. 先自己完整解一遍，得到标准答案。特别注意含参问题、判别式（Δ）的三种情况、定义域限制、区间端点能否取到等容易遗漏的关键情况。
+2. 再与学生作答逐项比较，判定“正确”或“错误”（学生没写的判“错误”，并在判定说明里注明“未作答”）。
+3. 若判“错误”，用一句话写出“关键检查点”：指出学生解题中遗漏或出错的那个关键情况，用通用表述，不要只写具体数值。例如：
+   · “遗漏了参数取某个特殊值的情况”
+   · “遗漏了二次方程判别式为零或为负的情况”
+   · “遗漏了定义域端点或分母为零的限制”
+   · “遗漏了区间端点能否取到”
+   · “某一步的符号或不等号方向处理错误”
+   若只是计算错误，写“仅计算错误，无遗漏关键情况”；若判“正确”，写“无”。
+4. 全部完成后整体复核一遍：重新检查每一道题的判定是否可靠，若发现草率判定或前后矛盾，以复核后的结果为准修正。
+
+输出 JSON 数组，每项只含 题号、AI判定（“正确”/“错误”）、判定说明（一句话）、关键检查点 四个字段。
+只输出 JSON，不要输出任何其他文字。
+"""
+        with st.spinner("② 判卷：AI 正在独立解题并与学生作答比较（含复核）..."):
+            raw2 = 调用模型(判卷prompt, API_KEY, model=MODEL_REASON)
+            判卷列表, 原始2 = 解析(raw2)
+        if not 判卷列表 or not isinstance(判卷列表, list):
+            st.session_state.原始文本 = 原始2
+            st.warning("判卷阶段返回非 JSON，原始内容如下：")
+            st.code(原始2)
+            st.stop()
+
+        # 合并识别结果与判卷结果
+        判卷映射 = {str(t.get("题号")): t for t in 判卷列表 if isinstance(t, dict)}
+        全部结果 = []
+        for 题 in 识别结果:
+            j = 判卷映射.get(str(题.get("题号")), {})
+            全部结果.append({
+                "题号": str(题.get("题号", "?")),
+                "题干": 题.get("题干", ""),
+                "学生作答": 题.get("学生作答", ""),
+                "AI判定": j.get("AI判定", "未知"),
+                "判定说明": j.get("判定说明", ""),
+                "关键检查点": j.get("关键检查点", "无"),
+            })
+        st.session_state.AI全部结果 = 规范化(全部结果)
+        st.session_state.识别结果 = None
+        st.session_state.预判 = None
+        st.session_state.诊断结果 = None
+        st.session_state.最终归因 = None
+        st.success(f"识别到 {len(全部结果)} 道题，AI 判卷完成。请在下方的【校对确认】环节核实错题。")
 
 # ========== 第1.5步：人工校对确认 ==========
 if st.session_state.get("AI全部结果"):
     st.subheader("①.5 校对确认（请核实 AI 的判卷结果）")
     st.caption("AI 视觉识别有限，偶尔会看错题号或漏判。请根据原图，勾选你认为**真正做错**的题目。")
-    
+
     所有题目 = st.session_state.AI全部结果
     错题选项 = [f"第 {t.get('题号', '?')} 题" for t in 所有题目]
     AI判定的错题 = [f"第 {t.get('题号', '?')} 题" for t in 所有题目 if t.get("AI判定") in ["错误", "错"]]
-    
+
     with st.expander("查看 AI 对所有题目的判定详情", expanded=False):
         for 题 in 所有题目:
             st.write(f"**第 {题.get('题号', '?')} 题**：AI 判定【{题.get('AI判定', '未知')}】—— {题.get('判定说明', '')}")
@@ -344,14 +393,12 @@ if st.session_state.get("识别结果"):
             st.warning("还有题目没有完成必选项。")
         else:
             st.session_state.预判 = 预判
-            img_b64 = base64.b64encode(图片字节).decode()
-            mime = 图片类型
-            
-            # 逐题调用，保证不漏题、不漏字段
+
+            # 逐题调用（纯文本讲评，不再传图片；关键检查点降级为“候选”）
             诊断结果列表 = []
             progress_bar = st.progress(0)
             总题数 = len(st.session_state.识别结果)
-            
+
             for idx, 题 in enumerate(st.session_state.识别结果):
                 题号 = 题.get("题号", "?")
                 题干 = 题.get("题干", "")
@@ -359,7 +406,7 @@ if st.session_state.get("识别结果"):
                 关键检查点 = 题.get("关键检查点", "无")
                 当前预判 = 预判.get(题号, {})
                 预判文本 = json.dumps({题号: 当前预判}, ensure_ascii=False)
-                
+
                 progress_bar.progress((idx + 1) / 总题数, text=f"正在讲评第 {题号} 题...")
 
                 prompt = f"""
@@ -369,7 +416,13 @@ if st.session_state.get("识别结果"):
 题干：{题干}
 学生作答：{学生作答}
 学生预判：{预判文本}
-判卷时发现的关键检查点：{关键检查点}
+判卷阶段发现的关键检查点候选：{关键检查点}
+
+【关于关键检查点的说明】
+上面的“关键检查点”只是判卷阶段给出的候选，请你先核实它是否属实、是否真的解释了学生的问题：
+- 若属实，请在“解答”中覆盖它；
+- 若与本题不符或无法确认，**不要强行覆盖**，以你自己核实后的判断为准。
+宁可如实说明“无法确认”，也不要为了凑检查点而写错内容。
 
 【本册范围】{本册范围}
 【知识点体系】{知识点体系}
@@ -377,11 +430,8 @@ if st.session_state.get("识别结果"):
 【参考标签】{参考标签}
 
 【强制要求】
-1. 你的“解答”必须严格覆盖上面的【关键检查点】。例如：
-   - 如果检查点提到“遗漏了参数取某个特殊值的情况”，解答中必须显式写出 `当 a=0 时...` 等类似讨论。
-   - 如果检查点提到“遗漏了判别式的情况”，解答中必须完整写出 Δ>0, Δ=0, Δ<0 三种情况。
+1. “解答”必须用 markdown 有序或无序列表分步写，公式用 $...$ 包裹，数学判断必须正确、可复算；不确定时写“此处需要进一步核对”，不要硬下结论。
 2. “与学生预判的对照”字段必须非空。格式固定为：“你选的是X；证据显示更准确的标签是Y，因为Z。”如果学生没选类型，写“你当时没有选类型，AI 判断为Y。”
-3. “解答”必须用 markdown 有序或无序列表分步写，公式用 $...$ 包裹。
 
 请输出**单个 JSON 对象**（不是数组），包含以下字段：
 - 题号
@@ -398,7 +448,7 @@ if st.session_state.get("识别结果"):
 只输出 JSON 对象，不要输出任何其他文字。
 """
                 try:
-                    raw = 调用模型(prompt, img_b64, mime, API_KEY)
+                    raw = 调用模型(prompt, API_KEY, model=MODEL_REASON, temperature=0)
                     结果, _ = 解析(raw)
                     if isinstance(结果, dict):
                         结果 = [结果]
@@ -413,7 +463,7 @@ if st.session_state.get("识别结果"):
                     st.error(f"第 {题号} 题讲评调用出错：{e}")
 
             progress_bar.empty()
-            
+
             if 诊断结果列表:
                 st.session_state.诊断结果 = 诊断结果列表
                 st.session_state.最终归因 = None
@@ -448,7 +498,7 @@ if st.session_state.get("诊断结果"):
             default_显示 = [短名转显示[t] for t in AI短名 if t in 短名转显示]
             选中的显示 = st.multiselect(f"第{题号}题你最终确认的归因", 显示选项, default=default_显示, key=f"f{题号}")
             最终归因[题号] = [显示转短名[x] for x in 选中的显示]
-            
+
     if st.button("保存最终归因"):
         st.session_state.最终归因 = 最终归因
         st.success("你的最终归因已保存，本阶段流程结束。")
