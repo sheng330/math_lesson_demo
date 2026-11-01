@@ -13,8 +13,8 @@ st.title("数学试卷 AI 讲评 Demo")
 
 # ========== 内置卷子库（明天加手写卷就在下面加一行） ==========
 内置卷子库 = {
-    "样卷 1：简单样卷（AI生成）": "builtin_papers/paper_1.png",
-    "样卷 2：由真实手写卷生成": "builtin_papers/handwriting_1.png",
+    "样卷 1：简单样卷（AI生成）": "builtin_papers/paper_1.jpg",
+    "样卷 2：由真实手写卷生成": "builtin_papers/handwriting_1.jpg",
 }
 
 # ========== 常量 ==========
