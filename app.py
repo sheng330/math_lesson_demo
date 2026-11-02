@@ -2,20 +2,32 @@ import streamlit as st
 import base64, json, requests, ast, time, os
 from collections import Counter
 
-# ==================== 在这里填写你的智谱 API Key ====================
+# ==================== 智谱 API Key（用 Secrets，不要把 Key 写进代码） ====================
 # 本机运行：在 .streamlit/secrets.toml 里写 ZHIPU_API_KEY = "你的Key"
 # 云端运行：在 Streamlit Cloud 的 Secrets 里填 ZHIPU_API_KEY
 API_KEY = st.secrets["ZHIPU_API_KEY"]
 # ====================================================================
 
+# ==================== 免费模型配置（2026-11 智谱免费档） ====================
+# 视觉识别（只读图抽文字）：glm-4.6v-flash（免费）
+# 判卷 + 讲评（数学推理）：glm-4.7-flash（免费文本模型，推理远强于视觉 flash）
+# 视觉识别模型链：优先用第一个，限流时自动切换下一个免费模型
+视觉模型链 = ["glm-4.6v-flash", "glm-4.1v-thinking-flash"]
+# 文本推理模型链：判卷/讲评用（全部免费）
+文本模型链 = ["glm-4.7-flash", "glm-4.5-flash", "glm-4-flash-250414"]
+TEMPERATURE  = 0.0   # 判卷/讲评用低温度，减少随机性
+# 提示：免费模型有并发/频率限制（429 错误码 1302 账户限流 / 1305 平台过载）。
+# 已做三件事缓解：① 限流时按错误码自适应退避重试；② 单个模型持续限流自动换免费备胎模型；
+# ③ 任务运行期间禁止重复点击按钮（防止并发堆积）。
+# ====================================================================
+
 st.set_page_config(page_title="数学试卷讲评 Demo", layout="wide")
 st.title("数学试卷 AI 讲评 Demo")
 
-# ========== 内置卷子库 ==========
+# ========== 内置卷子库（明天加手写卷就在下面加一行） ==========
 内置卷子库 = {
-    "样卷 1（AI生成）": "builtin_papers/paper_1.jpg",
-    "样卷 2（根据真实卷子生成的电子版本）": "builtin_papers/paper_2.jpg",
-    "样卷 3（手写题目）": "builtin_papers/paper_3.jpg"
+    "样卷 1：沪教版必修一模拟卷（电脑排版）": "builtin_papers/paper_1.jpg",
+    # "样卷 2：手写卷": "builtin_papers/handwriting_1.jpg",
 }
 
 # ========== 常量 ==========
@@ -126,42 +138,101 @@ for k in ["AI全部结果", "识别结果", "预判", "诊断结果", "最终归
         st.session_state[k] = None
 
 # ========== 工具函数 ==========
-def 调用模型(prompt, img_b64, mime, key, max_retries=4):
+def 调用模型(prompt, key, model, img_b64=None, mime=None, temperature=TEMPERATURE, max_tokens=None, max_retries=3):
+    """统一调用智谱 API。img_b64 传了就按多模态（图片+文本），否则纯文本。
+    429 限流时不立即放弃：按错误码自适应退避（1302 账户限流等 10s 起，1305 平台过载等更久），
+    重试次数有限，超限就交给上层换下一个免费模型，避免卡死等待。"""
     url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     headers = {"Authorization": f"Bearer {key}"}
+    if img_b64:
+        content = [
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+            {"type": "text", "text": prompt},
+        ]
+    else:
+        content = prompt  # 纯文本直接用字符串
     payload = {
-        "model": "glm-4v-flash",
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
-                {"type": "text", "text": prompt}
-            ]
-        }]
+        "model": model,
+        "temperature": temperature,
+        "messages": [{"role": "user", "content": content}],
     }
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+
+    最后的错误 = ""
     for attempt in range(max_retries):
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=120)
+            r = requests.post(url, headers=headers, json=payload, timeout=180)
+            if r.status_code == 200:
+                raw = r.json()["choices"][0]["message"]["content"].strip()
+                if raw.startswith("```"):
+                    raw = raw.split("\n", 1)[1] if "\n" in raw else raw
+                    raw = raw.rsplit("```", 1)[0]
+                return raw.strip()
+            # 解析错误码（1302=账户速率限制，1305=平台服务过载）
+            code, msg = None, r.text[:200]
+            try:
+                err = r.json().get("error", {})
+                if isinstance(err, dict):
+                    code = err.get("code")
+                    msg = err.get("message", "") or ""
+            except Exception:
+                pass
+            最后的错误 = f"HTTP {r.status_code} 错误码 {code}：{msg}"
             if r.status_code == 429:
-                time.sleep((attempt + 1) * 15)
+                wait = 10 + attempt * 10          # 账户限流：10s 起逐步退避
+                if code == 1305:
+                    wait = 20 + attempt * 15      # 平台过载：等更久一点
+                time.sleep(wait)
                 continue
             r.raise_for_status()
-            raw = r.json()["choices"][0]["message"]["content"].strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1] if "\n" in raw else raw
-                raw = raw.rsplit("```", 1)[0]
-            return raw.strip()
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
+            最后的错误 = str(e)
             if attempt == max_retries - 1:
-                raise
+                break
             time.sleep(5)
-    raise Exception("限流持续，请等待后重试")
+    raise Exception(f"「{model}」多次调用仍失败：{最后的错误}")
+
+def 调用模型带回退(prompt, key, 模型链, img_b64=None, mime=None, temperature=TEMPERATURE, max_tokens=None):
+    """依次尝试一组免费模型；单个模型持续限流时自动切换下一个。"""
+    最后的错误 = ""
+    for model in 模型链:
+        try:
+            return 调用模型(prompt, key, model, img_b64=img_b64, mime=mime,
+                            temperature=temperature, max_tokens=max_tokens)
+        except Exception as e:
+            最后的错误 = str(e)
+    raise Exception(f"多个免费模型调用均失败（可能当日额度用尽或平台过载，可稍后再试或到智谱控制台查看速率限制）：{最后的错误}")
 
 def 解析(raw):
-    try: return json.loads(raw), None
-    except: pass
-    try: return ast.literal_eval(raw), None
-    except: return None, raw
+    """尽量把模型输出解析为 Python 对象：直接解析 → 从文本中截取最外层 JSON 片段再解析。"""
+    if not isinstance(raw, str):
+        return None, raw
+    raw = raw.strip()
+    for fn in (json.loads, ast.literal_eval):
+        try:
+            return fn(raw), None
+        except Exception:
+            pass
+    # 模型偶尔会在 JSON 前后加说明文字：截取最外层 [ ] 或 { } 再试
+    for a, b in (("[", "]"), ("{", "}")):
+        i, j = raw.find(a), raw.rfind(b)
+        if i != -1 and j > i:
+            sub = raw[i:j + 1]
+            for fn in (json.loads, ast.literal_eval):
+                try:
+                    return fn(sub), None
+                except Exception:
+                    pass
+    return None, raw
+
+def 解包列表(结果):
+    """模型偶尔把数组包在对象里（如 {"结果": [...]}），取出第一个列表；没有则原样返回。"""
+    if isinstance(结果, dict):
+        for v in 结果.values():
+            if isinstance(v, list):
+                return v
+    return 结果
 
 def 清理数学文本(s):
     if not isinstance(s, str): return s
@@ -185,12 +256,32 @@ def 刷新():
     if hasattr(st, "rerun"): st.rerun()
     else: st.experimental_rerun()
 
+def 压缩图片(字节, 长边=1600, 质量=82):
+    """把图片压到长边≤1600px 再传给视觉模型，识别速度大幅提升。
+    没装 Pillow 或失败时原样返回。"""
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(字节))
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        w, h = img.size
+        if max(w, h) > 长边:
+            r = 长边 / max(w, h)
+            img = img.resize((int(w * r), int(h * r)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=质量)
+        return buf.getvalue(), "image/jpeg"
+    except Exception:
+        return 字节, None
+
 # ========== 侧边栏 ==========
 教材 = st.sidebar.selectbox("选择教材范围", 教材选项)
 知识点体系 = 知识点体系库[教材]
 
 # ========== 图片来源：上传 or 内置 ==========
 st.subheader("选择试卷")
+st.caption("隐私提示：试卷图片会上传到智谱 AI 接口处理。请确保图片中不含姓名、学校、学号、班级等个人信息，如有请先打码或裁剪后再上传。")
 图片来源 = st.radio("图片来源", ["上传图片", "使用内置卷子"], horizontal=True)
 
 图片字节 = None
@@ -216,57 +307,102 @@ if 图片字节 is not None:
     st.image(图片字节, caption="当前试卷", use_column_width=True)
     st.caption("确认试卷无误后，点击下方按钮开始识别。")
 
-# ========== 第1步：识别 ==========
+# ========== 第1步：识别 + 判卷（两阶段，读图与推理分离） ==========
 if st.button("① 开始识别"):
     if 图片字节 is None:
         st.warning("请先选择或上传试卷图片")
+    elif st.session_state.get("正在处理"):
+        st.warning("上一次任务还在处理中，请稍候再试。")
     else:
+        st.session_state.正在处理 = True
+        # 先压缩图片再传给视觉模型（提速）
+        图片字节, 压缩mime = 压缩图片(图片字节)
+        mime = 压缩mime or 图片类型
         img_b64 = base64.b64encode(图片字节).decode()
-        mime = 图片类型
-        prompt = """
-请阅读这张高中数学试卷照片，完成以下任务：
 
-【任务一：识别所有题目】
-逐题识别试卷上的每一道题，记录：题号、题干、学生手写作答。必须把整张卷子的每一道题都识别出来，不要遗漏任何题。
+        # ---- 阶段一：视觉识别（免费视觉模型，只抽文字，不判对错） ----
+        识别prompt = """
+请仔细阅读这张高中数学试卷照片，逐题识别卷面上的题目，不要遗漏任何一道题。
 
-【任务二：AI 自主判卷】
-对每道题，你先自己解一遍，得到正确答案，然后与学生答案比较。
-注意：请特别严格地检查“含参问题”、“二次方程/不等式”、“定义域受限”、“端点能否取到”这类容易漏掉关键情况的题。
-
-【任务三：输出结果】
 对每一道题输出：
-- 题号（字符串）
-- 题干
-- 学生作答
-- AI判定：填“正确”或“错误”
-- 判定说明：一句话说明判定原因
-- 关键检查点：如果这道题判为“错误”，用一句话写出“学生解题时遗漏或出错的那个关键情况”。
-  要求用通用表述，不要只写具体数值，例如：
-  · “遗漏了参数取某个特殊值的情况”
-  · “遗漏了二次方程判别式为零或为负的情况”
-  · “遗漏了定义域端点或分母为零的限制”
-  · “遗漏了区间端点能否取到”
-  · “某一步的符号或不等号方向处理错误”
-  如果学生没有遗漏关键情况（例如只是计算错），写“仅计算错误，无遗漏关键情况”。
-  如果这道题判为“正确”，写“无”。
+- 题号（按卷面顺序的编号，字符串）
+- 题干（完整转写题目文字）
+- 学生作答（该题下学生的书写内容，尽力转写；实在看不清写“（看不清）”）
 
-请输出所有题目的 JSON 数组。不要做讲评，不要输出其他文字。
+要求：
+- 打印题和手写作答都要识别，不要漏题。
+- 只做文字转写，不要解题、不要判对错、不要讲评。
+- 忽略试卷上的姓名、学校、学号、班级等与题目无关的个人信息，不要转写。
+- 数学公式用线性文本表达，例如：f(x)=sqrt(x-1)+1/(x-2)、x^2-3x+2≤0、log2(x)≥1、|x-1|≤2、x^2+bx+c、a≠0、Δ=b^2-4ac。
+
+输出 JSON 数组，每项只含 题号、题干、学生作答 三个字段。只输出 JSON，不要输出任何其他文字。
 """
-        with st.spinner("AI 正在识别并判卷（免费模型较慢，约 2-4 分钟，请耐心等待）..."):
-            raw = 调用模型(prompt, img_b64, mime, API_KEY)
-            结果, 原始 = 解析(raw)
-        if 结果:
-            结果 = 规范化(结果)
-            st.session_state.AI全部结果 = 结果
-            st.session_state.识别结果 = None
-            st.session_state.预判 = None
-            st.session_state.诊断结果 = None
-            st.session_state.最终归因 = None
-            st.success("AI 判卷完成，请在下方的【校对确认】环节核实错题。")
-        else:
+        with st.spinner("识别中（免费模型较慢，约 2-4 分钟，请耐心等待）..."):
+            raw = 调用模型带回退(识别prompt, API_KEY, 视觉模型链, img_b64=img_b64, mime=mime, max_tokens=6000)
+            识别结果, 原始 = 解析(raw)
+            识别结果 = 解包列表(识别结果)
+        if not 识别结果 or not isinstance(识别结果, list):
             st.session_state.原始文本 = 原始
-            st.warning("识别/判卷失败（模型返回非 JSON）。可点击上方『① 开始识别』按钮重试。\n原始内容如下：")
+            st.session_state.正在处理 = False
+            st.warning("识别失败（返回内容不是有效 JSON）。可点击上方『① 开始识别』按钮重试。\n内容开头：\n" + str(原始)[:200])
             st.code(原始)
+            st.stop()
+
+        # ---- 阶段二：文本判卷（免费文本模型，独立解题后与学生作答比较） ----
+        判卷prompt = f"""
+你是高中数学阅卷老师。下面是刚从试卷照片中识别出来的题目和学生作答（识别可能有少量误差，以你能读到的内容为准）。
+
+【题目列表】
+{json.dumps(识别结果, ensure_ascii=False, indent=1)}
+
+【超纲约束】{超纲约束}
+
+请对每一道题：
+1. 先自己完整解一遍，得到标准答案。特别注意含参问题、判别式（Δ）的三种情况、定义域限制、区间端点能否取到等容易遗漏的关键情况。
+2. 再与学生作答逐项比较，判定“正确”或“错误”（学生没写的判“错误”，并在判定说明里注明“未作答”）。
+3. 若判“错误”，用一句话写出“关键检查点”：指出学生解题中遗漏或出错的那个关键情况，用通用表述，不要只写具体数值。例如：
+   · “遗漏了参数取某个特殊值的情况”
+   · “遗漏了二次方程判别式为零或为负的情况”
+   · “遗漏了定义域端点或分母为零的限制”
+   · “遗漏了区间端点能否取到”
+   · “某一步的符号或不等号方向处理错误”
+   若只是计算错误，写“仅计算错误，无遗漏关键情况”；若判“正确”，写“无”。
+4. 全部完成后整体复核一遍：重新检查每一道题的判定是否可靠，若发现草率判定或前后矛盾，以复核后的结果为准修正。
+
+输出 JSON 数组，每项只含 题号、AI判定（“正确”/“错误”）、判定说明（一句话）、关键检查点 四个字段。
+只输出 JSON，不要输出任何其他文字。
+"""
+        with st.spinner("识别中（免费模型较慢，约 2-4 分钟，请耐心等待）..."):
+            raw2 = 调用模型带回退(判卷prompt, API_KEY, 文本模型链, max_tokens=6000)
+            判卷列表, 原始2 = 解析(raw2)
+            判卷列表 = 解包列表(判卷列表)
+        if not 判卷列表 or not isinstance(判卷列表, list):
+            st.session_state.原始文本 = 原始2
+            st.session_state.正在处理 = False
+            st.warning("判卷失败（返回内容不是有效 JSON）。可点击上方『① 开始识别』按钮重试。\n内容开头：\n" + str(原始2)[:200])
+            st.code(原始2)
+            st.stop()
+
+        # 合并识别结果与判卷结果
+        判卷映射 = {str(t.get("题号")): t for t in 判卷列表 if isinstance(t, dict)}
+        全部结果 = []
+        for 题 in 识别结果:
+            j = 判卷映射.get(str(题.get("题号")), {})
+            全部结果.append({
+                "题号": str(题.get("题号", "?")),
+                "题干": 题.get("题干", ""),
+                "学生作答": 题.get("学生作答", ""),
+                "AI判定": j.get("AI判定", "未知"),
+                "判定说明": j.get("判定说明", ""),
+                "关键检查点": j.get("关键检查点", "无"),
+            })
+        st.session_state.AI全部结果 = 规范化(全部结果)
+        st.session_state.识别结果 = None
+        st.session_state.预判 = None
+        st.session_state.诊断结果 = None
+        st.session_state.最终归因 = None
+        st.session_state.正在处理 = False
+        st.success(f"识别到 {len(全部结果)} 道题，AI 判卷完成。请在下方的【校对确认】环节核实错题。")
 
 # ========== 第1.5步：人工校对确认 ==========
 if st.session_state.get("AI全部结果"):
@@ -344,50 +480,126 @@ if st.session_state.get("识别结果"):
     if st.button("③ 提交预判，获取 AI 讲评"):
         if not 全部通过:
             st.warning("还有题目没有完成必选项。")
+        elif st.session_state.get("正在处理"):
+            st.warning("上一次任务还在处理中，请稍候再试。")
         else:
+            st.session_state.正在处理 = True
             st.session_state.预判 = 预判
-            img_b64 = base64.b64encode(图片字节).decode()
-            mime = 图片类型
 
-            # 逐题调用，保证不漏题、不漏字段
+            # ---- 批量讲评：一次调用输出所有题的讲评（快很多） ----
             诊断结果列表 = []
-            progress_bar = st.progress(0)
             总题数 = len(st.session_state.识别结果)
 
-            for idx, 题 in enumerate(st.session_state.识别结果):
-                题号 = 题.get("题号", "?")
-                题干 = 题.get("题干", "")
-                学生作答 = 题.get("学生作答", "")
-                关键检查点 = 题.get("关键检查点", "无")
-                当前预判 = 预判.get(题号, {})
-                预判文本 = json.dumps({题号: 当前预判}, ensure_ascii=False)
+            题目列表 = [{
+                "题号": 题.get("题号", "?"),
+                "题干": 题.get("题干", ""),
+                "学生作答": 题.get("学生作答", ""),
+                "学生预判": 预判.get(题.get("题号", "?"), {}),
+                "关键检查点候选": 题.get("关键检查点", "无"),
+            } for 题 in st.session_state.识别结果]
 
-                progress_bar.progress((idx + 1) / 总题数, text=f"正在讲评第 {题号} 题...")
+            批量prompt = f"""
+你是一位高中数学错题讲评老师。请对下面列表中的【每一道】错题逐一讲评，每道题独立输出一个 JSON 对象，最终输出为一个 JSON 数组（数组顺序与题目列表一致）。
 
-                prompt = f"""
+【题目列表】
+{json.dumps(题目列表, ensure_ascii=False, indent=1)}
+
+【关于关键检查点的说明】
+每道题的“关键检查点候选”只是判卷阶段给出的候选，请先核实它是否属实、是否真的解释了学生的问题：属实才在“解答”中覆盖它；与本题不符或无法确认时，不要强行覆盖，以你自己核实后的判断为准。
+
+【本册范围】{本册范围}
+【超纲约束】{超纲约束}
+【参考标签】{参考标签}
+
+【输出要求（务必精简，控制篇幅）】
+- 每道题的“解答”：用 markdown 列表分步写，公式用 $...$ 包裹，写清关键步骤和最终答案，保证可复算；中间计算步骤用“关键变形”合并，不要逐行展开，一道题解答控制在 10 步以内。
+- 其余文字字段一律精简：
+  - 错误性质描述：一句话。
+  - 判断证据：一句话。
+  - 重点提示：一句话。
+  - 讲评：不超过 3 句话。
+  - 可操作建议：一句话，具体可执行。
+- “与学生预判的对照”必须非空，按下面规则写：
+  - 学生预判的标签与你的判断一致：写“你选的「X」判断准确，证据支持这一归因：因为Z。”不要写“更准确”之类暗示判断不同的表述。
+  - 学生预判的标签与你的判断不一致：写“你选的是X；证据显示更准确的标签是Y，因为Z。”
+  - 学生没有选类型：写“你当时没有选类型，AI 判断为Y。”
+  - 学生可能选了多个标签，对照时针对与你判断相关的那一个写即可。
+- 数学判断必须正确、可复算；不确定时写“此处需要进一步核对”，不要硬下结论。
+
+请输出**单个 JSON 数组**，数组元素为包含以下字段的对象：
+- 题号
+- 知识点定位（限《本册范围》内的章节）
+- 错误性质描述
+- 参考标签（数组）
+- 判断证据
+- 与学生预判的对照
+- 解答
+- 重点提示
+- 讲评
+- 可操作建议
+
+只输出 JSON 数组，不要输出任何其他文字。
+"""
+            with st.spinner(f"正在批量讲评 {总题数} 道题（免费模型较慢，约 2-4 分钟，请耐心等待）..."):
+                try:
+                    raw = 调用模型带回退(批量prompt, API_KEY, 文本模型链, temperature=0, max_tokens=24000)
+                    结果, _ = 解析(raw)
+                    结果 = 解包列表(结果)
+                    if isinstance(结果, dict):
+                        结果 = [结果]
+                    if 结果 and isinstance(结果, list):
+                        诊断结果列表 = 规范化(结果)
+                        for 单题 in 诊断结果列表:
+                            if not 单题.get("与学生预判的对照"):
+                                单题["与学生预判的对照"] = "（对照生成失败，请参考错误性质和解答理解本题卡点）"
+                except Exception as e:
+                    st.warning(f"批量讲评失败：{e}，回退为逐题讲评…")
+
+            if not 诊断结果列表:
+                # ---- 回退：逐题讲评（批量失败时才走这里） ----
+                progress_bar = st.progress(0)
+                for idx, 题 in enumerate(st.session_state.识别结果):
+                    题号 = 题.get("题号", "?")
+                    题干 = 题.get("题干", "")
+                    学生作答 = 题.get("学生作答", "")
+                    关键检查点 = 题.get("关键检查点", "无")
+                    当前预判 = 预判.get(题号, {})
+                    预判文本 = json.dumps({题号: 当前预判}, ensure_ascii=False)
+
+                    progress_bar.progress((idx + 1) / 总题数, text=f"正在逐题讲评第 {题号} 题...")
+
+                    prompt = f"""
 你是一位高中数学错题讲评老师。请**只针对第 {题号} 题**进行讲评。不要输出其他题目，不要泛泛而谈。
 
 【本题信息】
 题干：{题干}
 学生作答：{学生作答}
 学生预判：{预判文本}
-判卷时发现的关键检查点：{关键检查点}
+判卷阶段发现的关键检查点候选：{关键检查点}
+
+【关于关键检查点的说明】
+上面的“关键检查点”只是判卷阶段给出的候选，请你先核实它是否属实、是否真的解释了学生的问题：
+- 若属实，请在“解答”中覆盖它；
+- 若与本题不符或无法确认，**不要强行覆盖**，以你自己核实后的判断为准。
+宁可如实说明“无法确认”，也不要为了凑检查点而写错内容。
 
 【本册范围】{本册范围}
-【知识点体系】{知识点体系}
 【超纲约束】{超纲约束}
 【参考标签】{参考标签}
 
-【强制要求】
-1. 你的“解答”必须严格覆盖上面的【关键检查点】。例如：
-   - 如果检查点提到“遗漏了参数取某个特殊值的情况”，解答中必须显式写出 `当 a=0 时...` 等类似讨论。
-   - 如果检查点提到“遗漏了判别式的情况”，解答中必须完整写出 Δ>0, Δ=0, Δ<0 三种情况。
-2. “与学生预判的对照”字段必须非空。格式固定为：“你选的是X；证据显示更准确的标签是Y，因为Z。”如果学生没选类型，写“你当时没有选类型，AI 判断为Y。”
-3. “解答”必须用 markdown 有序或无序列表分步写，公式用 $...$ 包裹。
+【输出要求（务必精简，控制篇幅）】
+- “解答”：用 markdown 列表分步写，公式用 $...$ 包裹，写清关键步骤和最终答案，保证可复算；中间计算步骤用“关键变形”合并，不要逐行展开，解答控制在 10 步以内。
+- 其余文字字段一律精简：错误性质描述一句话；判断证据一句话；重点提示一句话；讲评不超过 3 句话；可操作建议一句话。
+- “与学生预判的对照”必须非空，按下面规则写：
+  - 学生预判的标签与你的判断一致：写“你选的「X」判断准确，证据支持这一归因：因为Z。”不要写“更准确”之类暗示判断不同的表述。
+  - 学生预判的标签与你的判断不一致：写“你选的是X；证据显示更准确的标签是Y，因为Z。”
+  - 学生没有选类型：写“你当时没有选类型，AI 判断为Y。”
+  - 学生可能选了多个标签，对照时针对与你判断相关的那一个写即可。
+- 数学判断必须正确、可复算；不确定时写“此处需要进一步核对”，不要硬下结论。
 
 请输出**单个 JSON 对象**（不是数组），包含以下字段：
 - 题号
-- 知识点定位
+- 知识点定位（限《本册范围》内的章节）
 - 错误性质描述
 - 参考标签（数组）
 - 判断证据
@@ -399,28 +611,29 @@ if st.session_state.get("识别结果"):
 
 只输出 JSON 对象，不要输出任何其他文字。
 """
-                try:
-                    raw = 调用模型(prompt, img_b64, mime, API_KEY)
-                    结果, _ = 解析(raw)
-                    if isinstance(结果, dict):
-                        结果 = [结果]
-                    if 结果 and isinstance(结果, list) and len(结果) > 0:
-                        单题结果 = 规范化(结果)[0]
-                        if not 单题结果.get("与学生预判的对照"):
-                            单题结果["与学生预判的对照"] = "（对照生成失败，请参考错误性质和解答理解本题卡点）"
-                        诊断结果列表.append(单题结果)
-                    else:
-                        st.warning(f"第 {题号} 题讲评解析失败，已跳过。原始返回：{raw[:100]}...")
-                except Exception as e:
-                    st.error(f"第 {题号} 题讲评调用出错：{e}")
-
-            progress_bar.empty()
+                    try:
+                        raw = 调用模型带回退(prompt, API_KEY, 文本模型链, temperature=0, max_tokens=8000)
+                        结果, _ = 解析(raw)
+                        if isinstance(结果, dict):
+                            结果 = [结果]
+                        if 结果 and isinstance(结果, list) and len(结果) > 0:
+                            单题结果 = 规范化(结果)[0]
+                            if not 单题结果.get("与学生预判的对照"):
+                                单题结果["与学生预判的对照"] = "（对照生成失败，请参考错误性质和解答理解本题卡点）"
+                            诊断结果列表.append(单题结果)
+                        else:
+                            st.warning(f"第 {题号} 题讲评解析失败，已跳过。原始返回：{raw[:100]}...")
+                    except Exception as e:
+                        st.error(f"第 {题号} 题讲评调用出错：{e}")
+                progress_bar.empty()
 
             if 诊断结果列表:
+                st.session_state.正在处理 = False
                 st.session_state.诊断结果 = 诊断结果列表
                 st.session_state.最终归因 = None
                 刷新()
             else:
+                st.session_state.正在处理 = False
                 st.error("所有题目讲评均失败，请检查网络或 API Key。")
 
 # ========== 第3步：对照 + 修正 ==========
