@@ -24,7 +24,7 @@ TEMPERATURE  = 0.0   # 判卷/讲评用低温度，减少随机性
 st.set_page_config(page_title="数学试卷讲评 Demo", layout="wide")
 st.title("数学试卷 AI 讲评 Demo")
 
-# ========== 内置卷子库（明天加手写卷就在下面加一行） ==========
+# ========== 内置卷子库 ==========
 内置卷子库 = {
     "样卷 1（AI生成）": "builtin_papers/paper_1.jpg",
     "样卷 2（手写卷转录为打字版）": "builtin_papers/paper_2.jpg",
@@ -194,15 +194,25 @@ def 调用模型(prompt, key, model, img_b64=None, mime=None, temperature=TEMPER
             time.sleep(5)
     raise Exception(f"「{model}」多次调用仍失败：{最后的错误}")
 
-def 调用模型带回退(prompt, key, 模型链, img_b64=None, mime=None, temperature=TEMPERATURE, max_tokens=None):
-    """依次尝试一组免费模型；单个模型持续限流时自动切换下一个。"""
+def 调用模型带回退(prompt, key, 模型链, img_b64=None, mime=None, temperature=TEMPERATURE, max_tokens=None, 校验=None):
+    """依次尝试一组免费模型；调用异常、或返回内容通不过校验（如不是 JSON）时自动切换下一个模型。"""
     最后的错误 = ""
+    最后的原始 = ""
     for model in 模型链:
         try:
-            return 调用模型(prompt, key, model, img_b64=img_b64, mime=mime,
+            raw = 调用模型(prompt, key, model, img_b64=img_b64, mime=mime,
                             temperature=temperature, max_tokens=max_tokens)
+            if 校验 is not None:
+                ok, reason = 校验(raw)
+                if not ok:
+                    最后的错误 = f"「{model}」返回内容未通过校验（{reason}）"
+                    最后的原始 = raw
+                    continue
+            return raw
         except Exception as e:
             最后的错误 = str(e)
+    if 最后的原始:
+        raise Exception(f"返回内容不是有效 JSON（多个模型均失败）。最后返回内容开头：{最后的原始[:200]}")
     raise Exception(f"多个免费模型调用均失败（可能当日额度用尽或平台过载，可稍后再试或到智谱控制台查看速率限制）：{最后的错误}")
 
 def 解析(raw):
@@ -234,6 +244,22 @@ def 解包列表(结果):
             if isinstance(v, list):
                 return v
     return 结果
+
+def 校验识别(raw):
+    """识别结果必须能解析为「非空、全为对象」的 JSON 数组，否则视为模型失败，交给下一个模型重试。"""
+    结果, _ = 解析(raw)
+    结果 = 解包列表(结果)
+    if isinstance(结果, list) and len(结果) > 0 and all(isinstance(t, dict) for t in 结果):
+        return True, ""
+    return False, "不是有效 JSON 数组"
+
+def 校验判卷(raw):
+    """判卷结果必须能解析为「非空」的 JSON 数组，否则视为模型失败，交给下一个模型重试。"""
+    结果, _ = 解析(raw)
+    结果 = 解包列表(结果)
+    if isinstance(结果, list) and len(结果) > 0:
+        return True, ""
+    return False, "不是有效 JSON 数组"
 
 def 清理数学文本(s):
     if not isinstance(s, str): return s
@@ -339,7 +365,13 @@ if st.button("① 开始识别"):
 输出 JSON 数组，每项只含 题号、题干、学生作答 三个字段。只输出 JSON，不要输出任何其他文字。
 """
         with st.spinner("识别中（免费模型较慢，约 2-4 分钟，请耐心等待）..."):
-            raw = 调用模型带回退(识别prompt, API_KEY, 视觉模型链, img_b64=img_b64, mime=mime, max_tokens=6000)
+            try:
+                raw = 调用模型带回退(识别prompt, API_KEY, 视觉模型链, img_b64=img_b64, mime=mime, max_tokens=3000, 校验=校验识别)
+            except Exception as e:
+                st.session_state.原始文本 = str(e)
+                st.session_state.正在处理 = False
+                st.warning(str(e) + "\n可点击上方『① 开始识别』按钮重试。")
+                st.stop()
             识别结果, 原始 = 解析(raw)
             识别结果 = 解包列表(识别结果)
         if not 识别结果 or not isinstance(识别结果, list):
@@ -374,7 +406,13 @@ if st.button("① 开始识别"):
 只输出 JSON，不要输出任何其他文字。
 """
         with st.spinner("识别中（免费模型较慢，约 2-4 分钟，请耐心等待）..."):
-            raw2 = 调用模型带回退(判卷prompt, API_KEY, 文本模型链, max_tokens=6000)
+            try:
+                raw2 = 调用模型带回退(判卷prompt, API_KEY, 文本模型链, max_tokens=4000, 校验=校验判卷)
+            except Exception as e:
+                st.session_state.原始文本 = str(e)
+                st.session_state.正在处理 = False
+                st.warning(str(e) + "\n可点击上方『① 开始识别』按钮重试。")
+                st.stop()
             判卷列表, 原始2 = 解析(raw2)
             判卷列表 = 解包列表(判卷列表)
         if not 判卷列表 or not isinstance(判卷列表, list):
